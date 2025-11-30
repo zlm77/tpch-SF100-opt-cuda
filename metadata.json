@@ -1,0 +1,5 @@
+{
+  "name": "CUDA TPC-H Optimizer",
+  "description": "Interactive guide and code generator for optimizing TPC-H Lineitem aggregations using CUDA, featuring performance visualization and AI assistance.",
+  "requestFramePermissions": []
+}
