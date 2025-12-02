@@ -10,7 +10,7 @@ Focus on concepts like:
 3. Grid-Stride Loops to handle arbitrary input sizes.
 4. Warp Shuffle reduction for high performance within blocks.
 5. Avoiding Atomic contention.
-6. CPU Branch Misprediction vs GPU Predicated Execution.
+6. Solving the Memory Wall via Compression (FP16/Int8).
 Provide concise, technical, and accurate C++ CUDA code snippets when asked.`;
 
 export const HARDWARE_SPECS = {
@@ -45,14 +45,22 @@ export const MEMORY_BOUND_STEPS: OptimizationStep[] = [
     code: `// Host Code (C++)
 #include <iostream>
 #include <vector>
+#include <chrono>
 
 void sum_cpu(const std::vector<double>& h_input) {
+    auto start = std::chrono::high_resolution_clock::now();
+    
     double sum = 0.0;
     // Standard serial loop
-    // ~1.25s for 600M items
+    // Execution Time: ~1.25s for 600M items
+    // Limited by instruction latency
     for (double val : h_input) {
         sum += val;
     }
+    
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> ms = end - start;
+    printf("Time: %f ms\\n", ms.count());
 }`
   },
   {
@@ -64,15 +72,20 @@ void sum_cpu(const std::vector<double>& h_input) {
     effectiveBandwidth: DATA_SIZE_GB / 0.050, // ~96 GB/s
     code: `// Host Code (C++) with OpenMP
 #include <omp.h>
+#include <vector>
+#include <iostream>
 
 void sum_cpu_omp(const std::vector<double>& h_input) {
     double total_sum = 0.0;
     
     // Saturation of Memory Bus
+    // Execution Time: ~50ms
     #pragma omp parallel for reduction(+:total_sum)
     for (size_t i = 0; i < h_input.size(); i++) {
         total_sum += h_input[i];
     }
+    
+    printf("Total Sum: %f\\n", total_sum);
 }`
   },
   {
@@ -83,9 +96,10 @@ void sum_cpu_omp(const std::vector<double>& h_input) {
     executionTime: 45000.0,
     effectiveBandwidth: DATA_SIZE_GB / 45.0, 
     code: `__global__ void sum_naive(const double* input, double* output, size_t n) {
-    size_t idx = ...;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         // Massive Contention
+        // 600 Million threads fighting for one lock
         atomicAdd(output, input[idx]);
     }
 }`
@@ -99,7 +113,26 @@ void sum_cpu_omp(const std::vector<double>& h_input) {
     effectiveBandwidth: DATA_SIZE_GB / 0.022, 
     code: `__global__ void sum_shared(const double* input, double* output, size_t n) {
     __shared__ double sdata[256];
-    // ... Load & Reduce in Shared Mem ...
+    unsigned int tid = threadIdx.x;
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Load data
+    double sum = 0.0;
+    while (i < n) {
+        sum += input[i];
+        i += gridDim.x * blockDim.x; 
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Reduction in Shared Mem
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+    
     if (tid == 0) atomicAdd(output, sdata[0]);
 }`
   },
@@ -110,14 +143,28 @@ void sum_cpu_omp(const std::vector<double>& h_input) {
     performanceMetric: 390.6,
     executionTime: 3.2,
     effectiveBandwidth: DATA_SIZE_GB / 0.0032, // ~1500 GB/s
-    code: `__global__ void sum_warp_shuffle(...) {
-    // Highly optimized Grid-Stride Loop
-    // Saturated HBM2e bandwidth
-    for (int i = ...; i < n; i += stride) {
+    code: `__inline__ __device__ double warpReduceSum(double val) {
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
+__global__ void sum_warp_shuffle(const double* input, double* output, size_t n) {
+    double sum = 0.0;
+    // Grid-Stride Loop ensures Memory Coalescing
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; 
+         i < n; 
+         i += blockDim.x * gridDim.x) {
         sum += input[i];
     }
+
+    // Warp Reduction (No Shared Mem needed)
     sum = warpReduceSum(sum);
-    // ...
+
+    // Atomic add only once per warp (or block)
+    if ((threadIdx.x % 32) == 0) {
+        atomicAdd(output, sum);
+    }
 }`
   },
   {
@@ -130,20 +177,32 @@ void sum_cpu_omp(const std::vector<double>& h_input) {
     code: `#include <cuda_fp16.h>
 
 __global__ void sum_compressed(const half* __restrict__ input, float* output, size_t n) {
-    // Load 128 bits (8 x FP16 values) at once
-    // Vectorized loads maximize memory efficiency
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // 1. Vectorized Load (Crucial for Bandwidth)
+    // We cast the input pointer to float4* to load 128 bits (16 bytes) in a single instruction.
+    // Since sizeof(half) = 2 bytes, this fetches 8 FP16 values at once.
+    // This reduces the number of memory transactions by 8x compared to loading individually.
     float4 packed_data = reinterpret_cast<const float4*>(input)[idx];
     
-    // Unpack and accumulate in registers (fast)
+    // 2. Reinterpret as Packed Half-Precision Vectors
+    // We treat the loaded 16 bytes as an array of 4 'half2' vectors.
+    // 'half2' is a SIMD type containing two 16-bit floats packed together.
     half2* halves = reinterpret_cast<half2*>(&packed_data);
     
     float sum = 0.0f;
+
+    // 3. Unpack and Accumulate
+    // We use #pragma unroll to force the compiler to inline these additions.
     #pragma unroll
     for(int k=0; k<4; k++) {
-        sum += __half2float(halves[k].x) + __half2float(halves[k].y);
+        // __half2float promotes the 16-bit float to a 32-bit float.
+        // This is essential to maintain precision when summing millions of values.
+        sum += __half2float(halves[k].x); // Lower 16 bits
+        sum += __half2float(halves[k].y); // Upper 16 bits
     }
     
-    // Standard reduction follows...
+    // ... Standard Warp Reduction & Atomic Add follows ...
 }`
   }
 ];
@@ -157,6 +216,9 @@ export const DB_FILTER_STEPS: OptimizationStep[] = [
       executionTime: 1600.0, 
       effectiveBandwidth: DATA_SIZE_GB / 1.6, 
       code: `// Host Code (C++) - DB Filter
+#include <vector>
+#include <iostream>
+
 void filter_sum_cpu(const std::vector<double>& h_input, double threshold) {
     double sum = 0.0;
     // PREDICATE: Branch Prediction struggles here if data is random
@@ -166,6 +228,7 @@ void filter_sum_cpu(const std::vector<double>& h_input, double threshold) {
             sum += val;
         }
     }
+    printf("Filter Sum: %f\\n", sum);
 }`
     },
     {
@@ -176,12 +239,22 @@ void filter_sum_cpu(const std::vector<double>& h_input, double threshold) {
       executionTime: 80.0, // 80ms (Slower than 50ms)
       effectiveBandwidth: DATA_SIZE_GB / 0.08, 
       code: `// Host Code (C++) - OpenMP
-#pragma omp parallel for reduction(+:total_sum)
-for (size_t i = 0; i < h_input.size(); i++) {
-    // CPU Branch Prediction misses cost ~15-20 cycles
-    if (h_input[i] > threshold) {
-        total_sum += h_input[i];
+#include <omp.h>
+#include <vector>
+#include <iostream>
+
+void filter_sum_omp(const std::vector<double>& h_input, double threshold) {
+    double total_sum = 0.0;
+
+    #pragma omp parallel for reduction(+:total_sum)
+    for (size_t i = 0; i < h_input.size(); i++) {
+        // CPU Branch Prediction misses cost ~15-20 cycles
+        // Performance drops due to pipeline flushes
+        if (h_input[i] > threshold) {
+            total_sum += h_input[i];
+        }
     }
+    printf("Total Sum: %f\\n", total_sum);
 }`
     },
     {
@@ -191,18 +264,34 @@ for (size_t i = 0; i < h_input.size(); i++) {
       performanceMetric: 484.8, 
       executionTime: 3.3, // 3.3ms (Barely slower than 3.2ms)
       effectiveBandwidth: DATA_SIZE_GB / 0.0033, 
-      code: `__global__ void filter_sum_gpu(..., double threshold) {
-    // ...
-    double val = input[i];
-    
-    // GPU handles this efficiently via Predication
-    // The compiler converts this to a masked add instructions
-    // No pipeline flush involved
-    if (val > threshold) {
-        sum += val;
+      code: `__inline__ __device__ double warpReduceSum(double val) {
+    for (int offset = warpSize / 2; offset > 0; offset /= 2)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;
+}
+
+__global__ void filter_sum_gpu(const double* input, double* output, size_t n, double threshold) {
+    double sum = 0.0;
+    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = blockDim.x * gridDim.x;
+
+    for (size_t i = tid; i < n; i += stride) {
+        double val = input[i];
+        
+        // GPU handles this efficiently via Predication
+        // The compiler converts this to masked add instructions
+        // No pipeline flush involved
+        if (val > threshold) {
+            sum += val;
+        }
     }
+
+    // Standard Warp Reduction
+    sum = warpReduceSum(sum);
     
-    // ... Warp Reduction ...
+    if ((threadIdx.x % 32) == 0) {
+        atomicAdd(output, sum);
+    }
 }`
     }
   ];
